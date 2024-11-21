@@ -1,0 +1,421 @@
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <title>WebRTC Conference</title>
+        <script src="https://unpkg.com/htmx.org@1.9.6"></script>
+        <script src="https://cdnjs.cloudflare.com/ajax/libs/webrtc-adapter/8.2.3/adapter.min.js"></script>
+        <style>
+            .video-grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+                gap: 1rem;
+                padding: 1rem;
+            }
+            .video-container {
+                position: relative;
+                padding-top: 56.25%;
+                background: #000;
+                margin-bottom: 1rem;
+            }
+            .video-container video {
+                position: absolute;
+                top: 0;
+                left: 0;
+                width: 100%;
+                height: 100%;
+                object-fit: cover;
+            }
+            .video-label {
+                position: absolute;
+                bottom: 10px;
+                left: 10px;
+                color: white;
+                background: rgba(0,0,0,0.5);
+                padding: 5px;
+                border-radius: 4px;
+            }
+            .controls {
+                position: fixed;
+                bottom: 0;
+                left: 0;
+                right: 0;
+                padding: 1rem;
+                background: rgba(0, 0, 0, 0.8);
+                display: flex;
+                justify-content: center;
+                gap: 1rem;
+            }
+            button {
+                padding: 0.5rem 1rem;
+                border-radius: 4px;
+                border: none;
+                background: #2563eb;
+                color: white;
+                cursor: pointer;
+            }
+            button:hover {
+                background: #1d4ed8;
+            }
+            button.danger {
+                background: #dc2626;
+            }
+            button.danger:hover {
+                background: #b91c1c;
+            }
+        </style>
+    </head>
+    <body>
+    <div id="app">
+        <div class="video-grid" id="videoGrid"></div>
+
+        <div class="controls">
+            <button hx-post="/join-room"
+                    hx-trigger="click"
+                    hx-target="#videoGrid"
+                    hx-swap="beforeend">
+                Join Room
+            </button>
+
+            <button id="toggleVideo" onclick="toggleVideo()">
+                Turn Off Video
+            </button>
+
+            <button id="toggleAudio" onclick="toggleAudio()">
+                Mute
+            </button>
+
+            <button class="danger"
+                    hx-post="/leave-room"
+                    hx-trigger="click"
+                    hx-target="#app">
+                Leave Room
+            </button>
+        </div>
+    </div>
+
+    <script>
+        let pc;
+        let localStream;
+        let ws;
+        let pendingCandidates = [];
+        let remoteDescriptionSet = false;
+
+        const config = {
+            iceServers: [{
+                urls: ['stun:stun.l.google.com:19302']
+            }],
+            iceTransportPolicy: 'all',
+            bundlePolicy: 'max-bundle',
+            rtcpMuxPolicy: 'require'
+        };
+
+        window.onload = () => {
+            participantId = generateId();
+        };
+
+        function setupWebRTC(roomId) {
+            try {
+                console.log("Setting up WebRTC...");
+                // Сначала получаем медиа потоки
+                localStream = navigator.mediaDevices.getUserMedia({
+                    video: true,
+                    audio: true
+                }).then(stream => {
+                    console.log("Got local stream with tracks:",
+                        stream.getTracks().map(t => ({kind: t.kind, enabled: t.enabled}))
+                    );
+
+                    // Показываем локальное видео
+                    const videoEl = document.createElement('div');
+                    videoEl.className = 'video-container';
+                    videoEl.innerHTML = `
+                <video autoplay playsinline muted></video>
+                <div class="video-label">You</div>
+            `;
+                    videoEl.querySelector('video').srcObject = stream;
+                    document.getElementById('videoGrid').appendChild(videoEl);
+
+                    // Создаем WebSocket и PeerConnection
+                    connectWebSocket(roomId);
+                    setupPeerConnection();
+
+                    // Добавляем треки в PeerConnection
+                    stream.getTracks().forEach(track => {
+                        console.log(`Adding ${track.kind} track to PeerConnection`);
+                        if (pc && pc.connectionState !== 'closed') {
+                            const sender = pc.addTrack(track, stream);
+                            console.log(`Added ${track.kind} track to PC, sender:`, sender);
+                        }
+                    });
+
+                    localStream = stream;
+                }).catch(e => {
+                    console.error('Failed to get media devices:', e);
+                    alert('Failed to access camera/microphone');
+                });
+
+            } catch (err) {
+                console.error('Error in setupWebRTC:', err);
+            }
+        }
+
+        function connectWebSocket(roomId) {
+            const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = `${wsProtocol}//${window.location.host}/ws?id=${participantId}&room=${roomId}`;
+
+            ws = new WebSocket(wsUrl);
+            setupWebSocket();
+
+            ws.onclose = () => {
+                console.log('WebSocket disconnected. Attempting to reconnect...');
+                setTimeout(() => connectWebSocket(roomId), 3000);
+            };
+        }
+
+        function setupPeerConnection() {
+            if (pc) {
+                console.log('Cleaning up old peer connection');
+                if(localStream) {
+                    localStream.getTracks().forEach(track => track.stop());
+                }
+                pc.getSenders().forEach(sender => pc.removeTrack(sender));
+                pc.close();
+            }
+
+            console.log('Creating new PeerConnection with config:', config);
+            pc = new RTCPeerConnection(config);
+
+            pc.ontrack = (event) => {
+                console.log('ontrack event:', {
+                    kind: event.track.kind,
+                    enabled: event.track.enabled,
+                    muted: event.track.muted,
+                    streams: event.streams.length
+                });
+
+                const stream = event.streams[0];
+                if (!stream) {
+                    console.error('No stream in track event');
+                    return;
+                }
+
+                const trackKind = event.track.kind;
+                const streamId = stream.id;
+
+                console.log(`Processing ${trackKind} track from stream ${streamId}`);
+
+                // Check if container exists
+                let container = document.querySelector(`[data-stream-id="${streamId}"]`);
+
+                if (!container) {
+                    console.log(`Creating new container for stream ${streamId}`);
+                    container = document.createElement('div');
+                    container.className = 'video-container';
+                    container.setAttribute('data-stream-id', streamId);
+                    container.innerHTML = `
+                <video autoplay playsinline></video>
+                <div class="video-label">Remote User (${trackKind})</div>
+            `;
+                    document.getElementById('videoGrid').appendChild(container);
+
+                    const videoElement = container.querySelector('video');
+                    videoElement.srcObject = stream;
+
+                    videoElement.onloadedmetadata = () => {
+                        console.log(`Remote ${trackKind} track metadata loaded`);
+                        videoElement.play()
+                            .then(() => console.log(`Remote ${trackKind} playback started`))
+                            .catch(e => console.error(`Error playing remote ${trackKind}:`, e));
+                    };
+                } else {
+                    console.log(`Container for stream ${streamId} already exists`);
+                }
+            };
+
+            // Важный обработчик для создания offer при добавлении треков
+            pc.onnegotiationneeded = async () => {
+                console.log('Negotiation needed triggered');
+                try {
+                    await createAndSendOffer();
+                } catch (err) {
+                    console.error('Error during negotiation:', err);
+                }
+            };
+
+            pc.onicecandidate = event => {
+                if (event.candidate) {
+                    console.log('Sending ICE candidate:', {
+                        type: event.candidate.type,
+                        protocol: event.candidate.protocol,
+                        address: event.candidate.address
+                    });
+                    ws.send(JSON.stringify({
+                        event: 'candidate',
+                        data: JSON.stringify(event.candidate.toJSON())
+                    }));
+                }
+            };
+
+            pc.oniceconnectionstatechange = () => {
+                console.log('ICE connection state:', pc.iceConnectionState);
+            };
+
+            pc.onsignalingstatechange = () => {
+                console.log('Signaling state:', pc.signalingState);
+            };
+
+            pc.onconnectionstatechange = () => {
+                console.log('Connection state:', pc.connectionState);
+            };
+
+            return pc;
+        }
+
+        async function createAndSendOffer() {
+            if (!pc || pc.connectionState === 'closed') return;
+
+            console.log('Creating and sending offer...');
+
+            const offerOptions = {
+                offerToReceiveAudio: true,
+                offerToReceiveVideo: true,
+                iceRestart: true
+            };
+
+            try {
+                const offer = await pc.createOffer(offerOptions);
+                console.log('Offer created:', offer.type);
+
+                await pc.setLocalDescription(offer);
+                console.log('Local description set');
+
+                ws.send(JSON.stringify({
+                    event: 'offer',
+                    data: JSON.stringify(offer)
+                }));
+                console.log('Offer sent to server');
+            } catch (err) {
+                console.error('Error creating/sending offer:', err);
+            }
+        }
+
+        function setupWebSocket() {
+            ws.onmessage = async event => {
+                try {
+                    const message = JSON.parse(event.data);
+                    console.log('WebSocket message received:', message);
+
+                    switch (message.event) {
+                        case 'offer':
+                            console.log('Processing offer');
+                            const offer = JSON.parse(message.data);
+                            await pc.setRemoteDescription(new RTCSessionDescription(offer));
+                            console.log('Remote description set');
+
+                            const createdAnswer = await pc.createAnswer();
+                            await pc.setLocalDescription(createdAnswer);
+                            console.log('Local description (createdAnswer) set');
+
+                            ws.send(JSON.stringify({
+                                event: 'answer',
+                                data: JSON.stringify(createdAnswer)
+                            }));
+                            console.log('createdAnswer sent');
+                            break;
+
+                        case 'existing_tracks':
+                            console.log('Received existing tracks:', message.data);
+                            message.data.forEach(track => {
+                                console.log('Subscribing to track:', track);
+                                if (ws.readyState === WebSocket.OPEN) {
+                                    ws.send(JSON.stringify({
+                                        event: 'subscribe',
+                                        data: track.trackID
+                                    }));
+                                }
+                            });
+                            break;
+
+                        case 'new_track':
+                            console.log('New track notification received:', message.data);
+                            ws.send(JSON.stringify({
+                                event: 'subscribe',
+                                data: message.data.trackID
+                            }));
+                            break;
+
+                        case 'answer':
+                            const answer = JSON.parse(message.data);
+                            console.log('Setting remote description (answer):', answer);
+                            await pc.setRemoteDescription(new RTCSessionDescription(answer));
+                            remoteDescriptionSet = true;
+                            while (pendingCandidates.length) {
+                                const candidate = pendingCandidates.shift();
+                                await pc.addIceCandidate(new RTCIceCandidate(candidate));
+                            }
+                            break;
+
+                        case 'candidate':
+                            const candidate = JSON.parse(message.data);
+                            if (candidate && candidate.candidate) {
+                                try {
+                                    if (remoteDescriptionSet) {
+                                        await pc.addIceCandidate(new RTCIceCandidate(candidate));
+                                        console.log('Added ICE candidate:', candidate);
+                                    } else {
+                                        pendingCandidates.push(candidate);
+                                        console.log('Queued ICE candidate:', candidate);
+                                    }
+                                } catch (e) {
+                                    console.error('Error adding ICE candidate:', e);
+                                }
+                            }
+                            break;
+                    }
+                } catch (err) {
+                    console.error('Error processing message:', err);
+                }
+            };
+        }
+
+        function createBlackVideoTrack() {
+            const canvas = document.createElement('canvas');
+            canvas.width = 640;
+            canvas.height = 480;
+            const ctx = canvas.getContext('2d');
+            ctx.fillStyle = 'black';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            const stream = canvas.captureStream(30);
+            return stream.getVideoTracks()[0];
+        }
+
+        function generateId() {
+            return Math.random().toString(36).substr(2, 9);
+        }
+
+        function toggleVideo() {
+            const videoTrack = localStream.getVideoTracks()[0];
+            videoTrack.enabled = !videoTrack.enabled;
+            document.getElementById('toggleVideo').textContent =
+                videoTrack.enabled ? 'Turn Off Video' : 'Turn On Video';
+        }
+
+        function toggleAudio() {
+            const audioTrack = localStream.getAudioTracks()[0];
+            audioTrack.enabled = !audioTrack.enabled;
+            document.getElementById('toggleAudio').textContent =
+                audioTrack.enabled ? 'Mute' : 'Unmute';
+        }
+
+        // HTMX handlers
+        htmx.on('htmx:afterRequest', (event) => {
+            if (event.detail.pathInfo.requestPath === '/join-room') {
+                setupWebRTC('test-room-1');
+            }
+        });
+
+        let participantId = generateId();
+    </script>
+    </body>
+    </html>
